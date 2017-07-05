@@ -126,14 +126,16 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
   end
   
   def send_events(events)
+    mtx = Mutex.new
     successes = java.util.concurrent.atomic.AtomicInteger.new(0)
     failures  = java.util.concurrent.atomic.AtomicInteger.new(0)
     retries = java.util.concurrent.atomic.AtomicInteger.new(0)
     
-    pending = Queue.new
+    pending = java.util.concurrent.LinkedBlockingQueue.new
     events.each {|e| pending << [e, 0]}
     
-    while popped = pending.pop
+    while popped = pending.take
+      next if popped == nil
       break if popped == :done
       
       event, attempt = popped
@@ -142,26 +144,23 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
         begin 
           action = :failure if action == :retry && !@retry_failed
           
-          case action
-          when :success
-            successes.incrementAndGet
-          when :retry
-            retries.incrementAndGet
-            
-            next_attempt = attempt+1
-            sleep_for = sleep_for_attempt(next_attempt)
-            @logger.info("Retrying http request, will sleep for #{sleep_for} seconds")
-            timer_task = RetryTimerTask.new(pending, event, next_attempt)
-            @timer.schedule(timer_task, sleep_for*1000)
-          when :failure 
-            failures.incrementAndGet
-          else
-            raise "Unknown action #{action}"
-          end
-          
-          if action == :success || action == :failure 
-            if successes.get+failures.get == events.size
-              pending << :done
+          mtx.synchronize do
+            case action
+            when :success
+              successes.incrementAndGet
+            when :retry
+              puts "RETRYING"
+              retries.incrementAndGet
+              
+              next_attempt = attempt+1
+              sleep_for = sleep_for_attempt(next_attempt)
+              @logger.info("Retrying http request, will sleep for #{sleep_for} seconds")
+              timer_task = RetryTimerTask.new(pending, event, next_attempt)
+              @timer.schedule(timer_task, sleep_for*1000)
+            when :failure 
+              failures.incrementAndGet
+            else
+              raise "Unknown action #{action}"
             end
           end
         rescue => e 
@@ -172,6 +171,14 @@ class LogStash::Outputs::Http < LogStash::Outputs::Base
             :backtrace => e.backtrace)
           failures.incrementAndGet
           raise e
+        ensure
+          mtx.synchronize do
+            if action == :success || action == :failure 
+              if successes.get+failures.get == events.size
+                pending << :done
+              end
+            end
+          end
         end
       end
     end
